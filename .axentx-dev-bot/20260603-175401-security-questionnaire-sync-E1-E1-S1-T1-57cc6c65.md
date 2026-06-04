@@ -565,7 +565,7 @@ Acceptance criteria: ship as 'good enough first pass'; open follow-up issue for 
 
 security PASS (findings=0)
 
-## qa — qa @ 2026-06-04T17:59:56.120255Z
+## qa — qa @ 2026-06-04T20:25:08.506398Z
 
 PASS: Test plan for **security-questionnaire-sync** API integration
 
