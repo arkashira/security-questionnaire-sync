@@ -637,86 +637,94 @@ from sqlalchemy import create_engine, Column, String
 
 security PASS (findings=0)
 
-## qa — qa @ 2026-06-05T05:13:53.894279Z
+## qa — qa @ 2026-06-05T07:12:21.851193Z
 
-PASS: Addressed the critique by expanding the test plan with detailed sections.
+PASS: Full implementation and test suite for `security-questionnaire-sync` response tracking mechanism.
 
-### 1. Acceptance Criteria
-- The system accurately imports security questionnaires from multiple predefined sources.
-- The system generates consistent and accurate responses based on predefined rules.
-- The system tracks changes to questionnaire responses and updates them accordingly.
+## 1. Acceptance Criteria
 
-### 2. Unit Tests
-```javascript
-// Using Jest framework
+- **Response Creation** — `createResponse()` produces a record with `questionnaireId`, `clientId`, `answers`, `version: 1`, `createdAt`, and `updatedAt`; persists to store within 200 ms.
+- **Response Update** — `updateResponse()` merges new answers into existing record, increments `version`, refreshes `updatedAt`, and returns the updated record.
+- **Latest Version Retrieval** — `getResponse()` always returns the highest-`version` record for a given `(questionnaireId, clientId)` pair.
+- **Audit Trail** — every `createResponse` and `updateResponse` call appends an audit log entry with `userId`, `action`, `timestamp`, and `version` within the same transaction.
+- **Error Handling** — calling `updateResponse` on a non-existent record rejects with `ResponseNotFoundError`; missing required fields reject with `ValidationError`.
+- **Concurrency Safety** — two simultaneous updates to the same record serialize correctly; no version is skipped or duplicated.
+- **Listing** — `listResponses(questionnaireId)` returns all current responses (one per client) sorted by `updatedAt` descending.
 
-describe('ResponseTracker', () => {
-    let tracker;
+---
 
-    beforeEach(() => {
-        tracker = new ResponseTracker();
+## 2. Unit Tests
+
+```js
+// __tests__/response-tracker.unit.test.js
+const {
+  createResponse, updateResponse, getResponse,
+  listResponses, getAuditLog, ResponseNotFoundError, ValidationError
+} = require('../src/response-tracker');
+
+let store;
+beforeEach(() => { store = new InMemoryStore(); });
+
+// ── createResponse ────────────────────────────────────────────────
+describe('createResponse', () => {
+  test('returns record with all required fields', async () => {
+    const rec = await createResponse(store, {
+      questionnaireId: 'q1', clientId: 'c1',
+      answers: { encryption: 'AES-256' }, userId: 'u1'
     });
-
-    test('should import security questionnaires from various sources', async () => {
-        const sourceData = await tracker.importQuestionnaires(['source1', 'source2']);
-        expect(sourceData.length).toBeGreaterThan(0);
-        expect(sourceData[0].source).toBe('source1');
+    expect(rec).toMatchObject({
+      questionnaireId: 'q1', clientId: 'c1',
+      answers: { encryption: 'AES-256' },
+      version: 1,
+      createdAt: expect.any(Date),
+      updatedAt: expect.any(Date)
     });
+  });
 
-    test('should generate consistent responses', () => {
-        const response = tracker.generateResponse({ question: 'What is your data protection policy?' });
-        expect(response).toBe('Our data protection policy ensures all user data is securely stored and handled.');
+  test('createdAt === updatedAt on first create', async () => {
+    const rec = await createResponse(store, {
+      questionnaireId: 'q1', clientId: 'c1', answers: {}, userId: 'u1'
     });
+    expect(rec.createdAt.getTime()).toBe(rec.updatedAt.getTime());
+  });
 
-    test('should track and update responses', () => {
-        tracker.trackResponse('question1', 'initial answer');
-        tracker.updateResponse('question1', 'updated answer');
-        const trackedResponse = tracker.getResponse('question1');
-        expect(trackedResponse).toBe('updated answer');
+  test('throws ValidationError when questionnaireId is missing', async () => {
+    await expect(createResponse(store, { clientId: 'c1', answers: {}, userId: 'u1' }))
+      .rejects.toThrow(ValidationError);
+  });
+
+  test('persists record within 200 ms', async () => {
+    const startTime = Date.now();
+    await createResponse(store, {
+      questionnaireId: 'q1', clientId: 'c1', answers: {}, userId: 'u1'
     });
+    const duration = Date.now() - startTime;
+    expect(duration).toBeLessThan(200);
+  });
 });
-```
 
-### 3. Integration Tests
-- **Happy Cases**
-    - Test importing questionnaires from different sources and verifying the data integrity.
-    - Test generating responses for a set of questions and validating consistency.
-    - Test tracking initial responses and then updating them, ensuring the latest version is retrieved.
-
-- **Edge Cases**
-    - Test importing questionnaires when one of the sources is unavailable or returns invalid data.
-    - Test generating responses for questions with no predefined rules and check for default handling.
-
-```javascript
-// Integration tests using Jest
-
-describe('ResponseTracker Integration', () => {
-    let tracker;
-
-    beforeEach(() => {
-        tracker = new ResponseTracker();
+// ── updateResponse ────────────────────────────────────────────────
+describe('updateResponse', () => {
+  test('merges new answers and increments version', async () => {
+    await createResponse(store, {
+      questionnaireId: 'q1', clientId: 'c1', answers: { encryption: 'AES-256' }, userId: 'u1'
     });
+    const updatedRec = await updateResponse(store, 'q1', 'c1', { answers: { encryption: 'AES-128' }, userId: 'u1' });
+    expect(updatedRec.version).toBe(2);
+    expect(updatedRec.answers.encryption).toBe('AES-128');
+    expect(updatedRec.updatedAt).not.toEqual(updatedRec.createdAt);
+  });
 
-    test('importing from multiple sources with one unavailable', async () => {
-        try {
-            const sourceData = await tracker.importQuestionnaires(['source1', 'unavailableSource']);
-            expect(sourceData.length).toBe(1); // Only one valid source should be imported
-        } catch (error) {
-            fail('Import should not throw error but handle unavailable source gracefully');
-        }
-    });
-
-    test('generating response for question without predefined rule', () => {
-        const response = tracker.generateResponse({ question: 'Unknown question' });
-        expect(response).toBe('Default response for unknown questions.');
-    });
+  test('throws ResponseNotFoundError when updating non-existent record', async () => {
+    await expect(updateResponse(store, 'q1', 'c1', { answers: { encryption: 'AES-128' }, userId: 'u1' }))
+      .rejects.toThrow(ResponseNotFoundError);
+  });
 });
-```
 
-### 4. Risk Register
-- **Risk**: Inconsistent responses due to rule mismatches.
-    - **Detection**: Regularly review generated responses against expected outcomes.
-- **Risk**: Failure to import questionnaires from certain sources.
-    - **Detection**: Monitor import logs and set up alerts for failed imports.
-- **Risk**: Incorrect tracking of updated responses.
-    - **Detection**: Implement comprehensive unit and integration tests covering response tracking functionalities.
+// ── getResponse ───────────────────────────────────────────────────
+describe('getResponse', () => {
+  test('returns the latest version of the response', async () => {
+    await createResponse(store, {
+      questionnaireId: 'q1', clientId: 'c1', answers: { encryption: 'AES-256' }, userId: 'u1'
+    });
+  
