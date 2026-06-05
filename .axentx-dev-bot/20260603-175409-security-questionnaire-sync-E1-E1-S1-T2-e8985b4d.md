@@ -728,31 +728,99 @@ Acceptance criteria:
 
 security PASS (findings=0)
 
-## qa — qa @ 2026-06-05T05:31:14.733732Z
+## qa — qa @ 2026-06-05T06:59:36.106813Z
 
-<think>
-Okay, let's tackle this. The user wants a TDD test plan for the security-questionnaire-sync project. The previous attempt was blocked because the artifact was incomplete or truncated. So, I need to make sure the new test plan is thorough and covers all the acceptance criteria properly.
+PASS:  
 
-First, I need to revisit the acceptance criteria. The main points are importing questionnaires from various sources, generating consistent responses, and tracking updates. The previous test plan had seven acceptance criteria, but maybe they need to be more specific or measurable. Let me check each one again.
+---
 
-For the unit tests, the previous code was cut off. I need to complete those tests. The example given was for importing JSON, but I should also cover CSV and PDF. Also, the error handling for unsupported types wasn't fully tested. I should add tests for CSV and PDF parsing, and make sure each format is handled correctly.
+## 1. Acceptance Criteria
+1. **Import Capability** – The system can ingest questionnaire files in JSON, CSV, and PDF formats, correctly parsing at least 95 % of fields without manual correction.  
+2. **Response Generation** – For a given imported questionnaire, the generator produces a response document that:
+   - Includes answers for every required question.
+   - Uses the organization’s answer library (pre‑approved phrasing) with a match confidence ≥ 90 % for each answer.
+3. **Consistency** – Re‑running the generator on the same questionnaire version yields identical responses (deterministic output).  
+4. **Version Tracking** – Each generated response is stored with a version identifier and timestamp; updates to source questionnaires create a new version without overwriting previous responses.  
+5. **Audit Trail** – All import, generation, and update actions are logged with user ID, operation type, and outcome (success/failure).  
+6. **Performance** – Generation of a questionnaire with up to 500 questions completes in ≤ 2 seconds on a standard SaaS worker (2 vCPU, 4 GB RAM).  
+7. **Error Handling** – Unsupported file types, malformed files, or missing required fields result in a clear error message and do not create a response record.
 
-Integration tests are another area. The previous plan had some happy and edge cases, but maybe not enough. For example, when a questionnaire is updated, the system should create a new version. I need to test that scenario. Also, edge cases like missing required fields or large files should be included.
+---
 
-The risk register in the previous plan might have missed some points. For instance, if the answer library doesn't have a match for a question, the system should handle that gracefully. Also, performance under load or with large files could be a risk. I should add those to the risk register.
+## 2. Unit Tests (Jest‑style pseudo‑code)
 
-I need to ensure that all the acceptance criteria are covered in the tests. For example, the deterministic output requirement means that running the same questionnaire twice should produce identical responses. I should write a test for that. Also, the audit trail needs to log all actions, so there should be tests verifying that logs are created with the correct details.
+```javascript
+// response-generator.test.js
+import { importQuestionnaire, generateResponses, getResponseVersion, auditLog } from './response-generator';
+import fs from 'fs/promises';
 
-Another thing to consider is the error handling. The previous test had a test for unsupported file types, but maybe it's incomplete. I need to make sure that each error case (malformed files, missing fields) is tested and that the system returns appropriate error messages without creating a response.
+describe('Response Generator Unit Tests', () => {
+  const mockAnswerLibrary = {
+    "encryption-at-rest": "We encrypt all data at rest using AES‑256.",
+    // ... other pre‑approved answers
+  };
 
-I should also think about the data formats. The system needs to handle JSON, CSV, and PDF. Each of these might have different parsing challenges. For example, CSV might have different delimiters or encoding issues. PDFs could have varying structures. The tests should simulate these scenarios to ensure robustness.
+  beforeAll(() => {
+    // inject mock library into module (dependency injection)
+    jest.spyOn(require('./answer-library'), 'getAnswer').mockImplementation(
+      (key) => mockAnswerLibrary[key] || null
+    );
+  });
 
-In the unit tests, using mocks for the answer library is a good approach. But I need to make sure that the mocks cover all possible cases, like when a question doesn't have a matching answer in the library. The system should either use a default response or flag it for review.
+  test('importQuestionnaire parses valid JSON correctly', async () => {
+    const json = await fs.readFile('__fixtures__/questionnaire.json', 'utf8');
+    const result = importQuestionnaire(json, 'json');
+    expect(result.success).toBe(true);
+    expect(result.data.questions).toHaveLength(42);
+    expect(result.data.questions[0]).toMatchObject({
+      id: expect.any(String),
+      text: expect.any(String),
+      required: true,
+    });
+  });
 
-For the integration tests, testing the end-to-end flow from import to response generation to version tracking is crucial. Maybe create a scenario where a questionnaire is imported, a response is generated, then the questionnaire is updated, and a new response is created with a new version. This would test version tracking and audit logging.
+  test('importQuestionnaire rejects unsupported file type', () => {
+    const result = importQuestionnaire('some data', 'xml');
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/unsupported file type/i);
+  });
 
-Performance is another key aspect. The acceptance criteria mention that generating a 500-question questionnaire should take ≤2 seconds. I need to include a performance test that measures the time taken and ensures it meets the requirement. However, in a unit test environment, timing might be tricky, so perhaps a mock or a separate performance test script is needed.
+  test('generateResponses returns deterministic output', () => {
+    const questionnaire = {
+      id: 'q123',
+      version: 1,
+      questions: [
+        { id: 'q1', key: 'encryption-at-rest', required: true },
+        { id: 'q2', key: 'incident-response', required: true },
+      ],
+    };
+    const first = generateResponses(questionnaire);
+    const second = generateResponses(questionnaire);
+    expect(first).toEqual(second);
+    expect(first.answers).toHaveLength(2);
+    expect(first.answers[0].answer).toBe(mockAnswerLibrary['encryption-at-rest']);
+  });
 
-The risk register should list potential issues like incorrect parsing of files leading to data loss, answer library mismatches causing incorrect responses, or audit logs not being written. Each risk should have a detection method, like automated tests or monitoring alerts.
+  test('generateResponses flags missing answer in library', () => {
+    const questionnaire = {
+      id: 'q124',
+      version: 1,
+      questions: [{ id: 'qX', key: 'unknown-key', required: true }],
+    };
+    const result = generateResponses(questionnaire);
+    expect(result.success).toBe(false);
+    expect(result.missingAnswers).toContain('unknown-key');
+  });
 
-I also need to make sure that the test plan is comprehensive enough that the verifier can see full coverage. The previous attempt was cut off, so completing all the tests and ensuring they align with the acceptan
+  test('getResponseVersion returns correct metadata', () => {
+    const resp = generateResponses(/* valid questionnaire */);
+    const meta = getResponseVersion(resp.id);
+    expect(meta.version).toBe(1);
+    expect(meta.timestamp).toBeInstanceOf(Date);
+  });
+
+  test('auditLog records successful import', () => {
+    const entry = auditLog.last(); // assume in‑memory logger for test
+    expect(entry).toMatchObject({
+      operation: 'import',
+      status: 'succ
