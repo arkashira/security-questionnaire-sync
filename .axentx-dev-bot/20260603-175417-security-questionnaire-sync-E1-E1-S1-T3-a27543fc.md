@@ -637,92 +637,129 @@ from sqlalchemy import create_engine, Column, String
 
 security PASS (findings=0)
 
-## qa — qa @ 2026-06-04T23:04:53.356895Z
+## qa — qa @ 2026-06-05T03:46:08.460014Z
 
-PASS: Implementation of response tracking and updating mechanism for security-questionnaire-sync is ready for testing.  
+PASS: TDD test plan for the response‑tracking and updating mechanism in **security‑questionnaire‑sync**.
 
 ---
 
 ## 1. Acceptance Criteria  
-- **Import Integrity** – The tracker must correctly associate each imported questionnaire with a unique `questionnaireId`.  
-- **Response Creation** – For any questionnaire, the system can create a new response record containing `questionnaireId`, `clientId`, `answers`, and a timestamp.  
-- **Response Update** – Existing responses can be updated by `questionnaireId` and `clientId`, preserving previous data and updating the `updatedAt` timestamp.  
-- **Versioning** – Each update increments a `version` field; the latest version is retrievable.  
-- **Audit Trail** – All create/update actions are logged with userId, action type, and timestamp.  
-- **Concurrency Safety** – Concurrent updates to the same response do not corrupt data; last‑write wins with proper locking.  
-- **Error Handling** – Invalid inputs (missing fields, non‑existent questionnaireId) return descriptive errors and do not create or modify records.
+1. **Import Integrity** – Every imported questionnaire is assigned a unique `questionnaireId` that is used as the primary key for all subsequent operations.  
+2. **Response Creation** – A new response record can be created with the fields: `questionnaireId`, `clientId`, `answers` (object), `createdAt`, `updatedAt`, `version` (initially 1).  
+3. **Response Update** – An existing response can be updated by `questionnaireId` + `clientId`; the `answers` object is merged (overwritten) and `updatedAt` is refreshed; `version` is incremented by 1.  
+4. **Audit Trail** – Every create or update emits an audit log entry containing `userId`, `action` (`CREATE`/`UPDATE`), `questionnaireId`, `clientId`, and a `timestamp`.  
+5. **Error Handling** –  
+   * Missing required fields → throws `ValidationError`.  
+   * Non‑existent `questionnaireId` or `clientId` on update → throws `NotFoundError`.  
+   * Duplicate create (same `questionnaireId` + `clientId`) → throws `ConflictError`.  
+6. **Concurrency Safety** – Concurrent updates to the same response do not corrupt data; the last‑write wins and the `version` reflects the final state.  
+7. **Data Consistency** – After any operation, `getResponse(questionnaireId, clientId)` returns the latest state, and `getAllResponses()` returns a snapshot that matches the underlying store.
 
 ---
 
-## 2. Unit Tests (pseudo‑code, Jest style)
+## 2. Unit Tests (Jest‑style pseudo‑code)
 
 ```js
-// response-tracker.test.js
-const { createResponse, updateResponse, getResponse, logAction } = require('./response-tracker');
+// __tests__/response-tracker.unit.test.js
+const {
+  createResponse,
+  updateResponse,
+  getResponse,
+  getAllResponses,
+  resetStore,          // helper to clear in‑memory DB
+  getAuditLog,
+} = require('../src/response-tracker');
 
-describe('Response Tracker', () => {
-  beforeEach(() => resetDatabase()); // mock DB reset
+describe('Response Tracker – Unit', () => {
+  beforeEach(() => resetStore());
 
-  test('creates a new response with correct fields', async () => {
+  // ---------- 1. Creation ----------
+  test('creates a new response with correct defaults', async () => {
     const res = await createResponse({
-      questionnaireId: 'q123',
-      clientId: 'c456',
-      answers: { q1: 'yes', q2: 'no' },
-      userId: 'u789'
+      questionnaireId: 'q1',
+      clientId: 'c1',
+      answers: { q1: 'yes' },
+      userId: 'u1',
     });
+
     expect(res).toMatchObject({
-      questionnaireId: 'q123',
-      clientId: 'c456',
-      answers: { q1: 'yes', q2: 'no' },
+      questionnaireId: 'q1',
+      clientId: 'c1',
+      answers: { q1: 'yes' },
       version: 1,
       createdAt: expect.any(Date),
-      updatedAt: expect.any(Date)
+      updatedAt: expect.any(Date),
     });
+
+    const audit = getAuditLog();
+    expect(audit).toContainEqual(
+      expect.objectContaining({
+        action: 'CREATE',
+        questionnaireId: 'q1',
+        clientId: 'c1',
+        userId: 'u1',
+      })
+    );
   });
 
-  test('updates an existing response and increments version', async () => {
-    const initial = await createResponse({ questionnaireId: 'q123', clientId: 'c456', answers: { q1: 'yes' }, userId: 'u1' });
-    const updated = await updateResponse('q123', 'c456', { q1: 'no' }, 'u2');
-    expect(updated.version).toBe(initial.version + 1);
-    expect(updated.answers.q1).toBe('no');
-    expect(updated.updatedAt).not.toEqual(initial.updatedAt);
+  test('throws ValidationError when required fields missing', async () => {
+    await expect(
+      createResponse({
+        questionnaireId: 'q2',
+        // clientId omitted
+        answers: { q1: 'no' },
+        userId: 'u2',
+      })
+    ).rejects.toThrow('ValidationError');
   });
 
-  test('returns error when updating non‑existent response', async () => {
-    await expect(updateResponse('q999', 'c000', { q1: 'yes' }, 'u1'))
-      .rejects.toThrow('Response not found');
+  test('throws ConflictError on duplicate create', async () => {
+    await createResponse({
+      questionnaireId: 'q3',
+      clientId: 'c3',
+      answers: {},
+      userId: 'u3',
+    });
+
+    await expect(
+      createResponse({
+        questionnaireId: 'q3',
+        clientId: 'c3',
+        answers: {},
+        userId: 'u4',
+      })
+    ).rejects.toThrow('ConflictError');
   });
 
-  test('audit log records create and update actions', async () => {
-    await createResponse({ questionnaireId: 'q123', clientId: 'c456', answers: {}, userId: 'u1' });
-    await updateResponse('q123', 'c456', {}, 'u2');
-    const logs = await getAuditLogs('q123', 'c456');
-    expect(logs).toHaveLength(2);
-    expect(logs[0].action).toBe('create');
-    expect(logs[1].action).toBe('update');
+  // ---------- 2. Update ----------
+  test('updates existing response and increments version', async () => {
+    const before = await createResponse({
+      questionnaireId: 'q4',
+      clientId: 'c4',
+      answers: { q1: 'yes' },
+      userId: 'u5',
+    });
+
+    const after = await updateResponse(
+      'q4',
+      'c4',
+      { q1: 'no', q2: 'maybe' },
+      'u6'
+    );
+
+    expect(after.version).toBe(before.version + 1);
+    expect(after.answers).toEqual({ q1: 'no', q2: 'maybe' });
+    expect(after.updatedAt).not.toEqual(before.updatedAt);
+
+    const audit = getAuditLog();
+    expect(audit).toContainEqual(
+      expect.objectContaining({
+        action: 'UPDATE',
+        questionnaireId: 'q4',
+        clientId: 'c4',
+        userId: 'u6',
+      })
+    );
   });
 
-  test('concurrent updates result in last‑write win', async () => {
-    await createResponse({ questionnaireId: 'q123', clientId: 'c456', answers: { q1: 'yes' }, userId: 'u1' });
-    const promises = [
-      updateResponse('q123', 'c456', { q1: 'no' }, 'u2'),
-      updateResponse('q123', 'c456', { q1: 'maybe' }, 'u3')
-    ];
-    const results = await Promise.all(promises);
-    const final = await getResponse('q123', 'c456');
-    // final answer should match one of the concurrent writes
-    expect(['no', 'maybe']).toContain(final.answers.q1);
-  });
-});
-```
-
----
-
-## 3. Integration Tests
-
-| Test # | Description | Expected Result |
-|--------|-------------|-----------------|
-| 1 | **Happy Path – Full Cycle** | Import questionnaire → create response → update response → fetch latest version. All data consistent. |
-| 2 | **Multiple Clients** | Two clients (`cA`, `cB`) create responses to same questionnaire. Each can update independently without interference. |
-| 3 | **Version Retrieval** | After 3 updates, `getResponse` returns version 4 and correct answers. |
-| 4 | **Audit Trail Integrity** | After 5 actions, audit log contains 5 
+  test('throws NotFoundEr
